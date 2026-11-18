@@ -25,14 +25,19 @@ jobs:
           node-version-file: package.json
           package-manager-cache: false
 
-      - name: Test the Shorts draft handoff
-        run: node --test scripts/shorts-draft.test.mjs scripts/shorts-draft-native-smoke.test.mjs
+      - name: Test the pilot scripts
+        run: |
+          node --test scripts/*.test.mjs
+          python3 -B -m unittest discover -s scripts -p test_shorts_draft_fixture_restore.py
 
       - name: Enable the pinned pnpm version
         run: corepack enable pnpm
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Test application code with Jest
+        run: pnpm test
 
       - name: Build
         run: pnpm run build

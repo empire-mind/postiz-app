@@ -34,6 +34,7 @@ model Organization {
   notifications       Notifications[]
   plugs               Plugs[]
   post                Post[]               @relation("organization")
+  draftIntakeReceipts DraftIntakeReceipt[]
   submittedPost       Post[]               @relation("submittedForOrg")
   sets                Sets[]
   signatures          Signatures[]
@@ -514,6 +515,18 @@ model Post {
   @@index([lastMessageId])
   @@index([createdAt])
   @@index([integrationId])
+}
+
+model DraftIntakeReceipt {
+  organizationId String
+  key            String       @db.VarChar(128)
+  requestHash    String       @db.VarChar(64)
+  postId         String
+  integrationId  String
+  createdAt      DateTime     @default(now())
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@id([organizationId, key])
 }
 
 model Notifications {

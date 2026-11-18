@@ -98,12 +98,13 @@ async function approvedMedia(file, manifest) {
 }
 
 function postizClient(endpoint, key) {
-  return async (method, path, body) => {
+  return async (method, path, body, headers) => {
     let response;
     try {
       response = await fetch(endpoint + path, {
         method,
         headers: {
+          ...headers,
           Authorization: key,
           ...(typeof body === 'string' ? { 'Content-Type': 'application/json' } : {}),
         },
@@ -234,11 +235,15 @@ async function handoff(options) {
   const { origin } = new URL(endpoint);
   const file = resolve(options.manifest);
   const { manifest, date, manifestSha256 } = await readManifest(file);
+  const key = process.env.POSTIZ_API_KEY;
   if (options.apply) {
     assert(options['expected-manifest-sha256'] === manifestSha256,
       'The reviewed manifest SHA-256 is required and must match.');
     assert(options['journal-dir'], 'Apply requires a persistent --journal-dir.');
-    assert(process.env.POSTIZ_API_KEY?.trim(), 'Set POSTIZ_API_KEY for the isolated Postiz workspace.');
+    assert(key?.trim(), 'Set POSTIZ_API_KEY for the isolated Postiz workspace.');
+    if (options['require-scoped-key']) {
+      assert(/^pzd_[a-f0-9]{64}$/.test(key), 'Set POSTIZ_API_KEY to a scoped draft credential.');
+    }
   }
   const media = await approvedMedia(file, manifest);
   const plan = {
@@ -255,7 +260,7 @@ async function handoff(options) {
   };
   if (!options.apply) return { ...plan, stage: 'planned' };
 
-  const request = postizClient(endpoint, process.env.POSTIZ_API_KEY);
+  const request = postizClient(endpoint, key);
   await verifyDestination(request, manifest);
 
   const directory = resolve(options['journal-dir']);
@@ -281,14 +286,19 @@ async function handoff(options) {
       'The upload response did not contain a media reference.'
     );
     const uploadUrl = new URL(uploaded.path);
+    const videoPath = /^\/uploads\/.+\.mp4$/.test(uploadUrl.pathname) ||
+      /^\/api\/media\/private-local\/\d{4}\/\d{2}\/\d{2}\/[a-f0-9]{32,64}\.mp4$/.test(uploadUrl.pathname);
     assert(
       uploadUrl.origin === origin && !uploadUrl.username && !uploadUrl.password &&
-        /^\/uploads\/.+\.mp4$/.test(uploadUrl.pathname) && !uploadUrl.search && !uploadUrl.hash,
+        videoPath && !uploadUrl.search && !uploadUrl.hash,
       'The upload is outside the isolated Postiz media origin.'
     );
     Object.assign(receipt, { stage: 'uploaded', mediaId: uploaded.id });
     await saveJournal(journal, receipt);
-    const created = await request('POST', '/posts', JSON.stringify(draftBody(manifest, date, uploaded)));
+    const created = await request('POST', '/posts', JSON.stringify(draftBody(manifest, date, uploaded)), {
+      'Idempotency-Key': digest(JSON.stringify([manifest.workspaceId, manifest.integrationId, manifest.contentId])),
+      'X-Postiz-Draft-Manifest-SHA256': manifestSha256,
+    });
     assert(
       Array.isArray(created) && created.length === 1 &&
         created[0]?.integration === manifest.integrationId &&
@@ -314,6 +324,7 @@ try {
       manifest: { type: 'string' },
       endpoint: { type: 'string' },
       apply: { type: 'boolean', default: false },
+      'require-scoped-key': { type: 'boolean', default: false },
       'expected-manifest-sha256': { type: 'string' },
       'journal-dir': { type: 'string' },
     },

@@ -1,6 +1,7 @@
 """Run the Shorts draft client against fresh, isolated Postiz services."""
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -16,8 +17,9 @@ import socket
 import subprocess
 import sys
 import tempfile
-from threading import Event, Thread
+from threading import Barrier, Event, Thread
 import time
+from urllib.error import HTTPError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
 
@@ -121,6 +123,20 @@ def sha256(path):
         return hashlib.file_digest(data, 'sha256').hexdigest()
 
 
+def fixture_draft_request(manifest_path, media):
+    manifest = json.loads(manifest_path.read_text())
+    key = hashlib.sha256(json.dumps(
+        [manifest['workspaceId'], manifest['integrationId'], manifest['contentId']],
+        separators=(',', ':'),
+    ).encode()).hexdigest()
+    return {
+        'type': 'draft', 'date': manifest['date'], 'shortLink': False, 'tags': [], 'creationMethod': 'CLI',
+        'posts': [{'type': 'draft', 'integration': {'id': manifest['integrationId']},
+                   'value': [{'content': f"<p>{manifest['caption']}</p>",
+                              'image': [{'id': media['id'], 'path': media['path']}]}]}],
+    }, {'Idempotency-Key': key, 'X-Postiz-Draft-Manifest-Sha256': sha256(manifest_path)}
+
+
 def stop(child):
     if child.poll() is None:
         child.terminate()
@@ -150,8 +166,9 @@ def start_fault_proxy(stack, proxy_port, backend_port):
             if not 0 <= size <= limit:
                 self.send_error(413)
                 return
-            headers = {name: self.headers[name] for name in ('Authorization', 'Content-Type')
-                       if name in self.headers}
+            headers = {name: self.headers[name] for name in (
+                'Authorization', 'Content-Type', 'Idempotency-Key', 'X-Postiz-Draft-Manifest-Sha256'
+            ) if name in self.headers}
             self.connection.settimeout(5)
             upstream = HTTPConnection('127.0.0.1', backend_port, timeout=5)
             try:
@@ -204,10 +221,17 @@ def smoke(args):
         run = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix='postiz-draft-smoke-')))
         upload = run / 'uploads'
         upload.mkdir()
+        media_root, media_prefix = upload, '/uploads/'
+        if args.verify_private_media:
+            from shorts_draft_private_media import PRIVATE_MEDIA_PREFIX, verify_private_media
+
+            media_root, media_prefix = run / 'private-media', PRIVATE_MEDIA_PREFIX
+            media_root.mkdir()
         pg_port, redis_port, temporal_port, backend_port, worker_port, proxy_port = ephemeral_ports(6)
         origin = f'http://127.0.0.1:{proxy_port}'
         api = origin + '/public/v1'
         first_key, second_key, password, jwt = [secrets.token_hex(32) for _ in range(4)]
+        draft_key = 'pzd_' + secrets.token_hex(32)
         namespace = 'shorts-fixtures-' + secrets.token_hex(6)
         database_user = 'fixture_' + secrets.token_hex(6)
         env = {
@@ -220,12 +244,16 @@ def smoke(args):
             'TEMPORAL_ADDRESS': f'127.0.0.1:{temporal_port}', 'TEMPORAL_NAMESPACE': namespace,
             'PORT': str(backend_port), 'ORCHESTRATOR_PORT': str(worker_port),
             'DISABLE_REGISTRATION': 'true',
+            'POSTIZ_PILOT_DRAFT_API_ORG_ID': WORKSPACE,
+            'POSTIZ_PILOT_DRAFT_API_KEY_SHA256': hashlib.sha256(draft_key.encode()).hexdigest(),
         }
+        if args.verify_private_media:
+            env['POSTIZ_PRIVATE_LOCAL_MEDIA_DIRECTORY'] = str(media_root)
         running = {}
         http = build_opener(ProxyHandler({}))
 
         def redact(detail):
-            for value in (first_key, second_key, password, jwt):
+            for value in (first_key, second_key, password, jwt, draft_key):
                 detail = detail.replace(value, '[fixture secret]')
             return detail
 
@@ -274,6 +302,26 @@ def smoke(args):
         def verify_backend():
             return get(api + '/me', first_key).get('organization', {}).get('id') == WORKSPACE
 
+        def draft_api_request(method, path, body=None, headers=None, *, status, port=None):
+            # Call the real backend directly so the synthetic proxy's own
+            # allowlist cannot satisfy the scope or idempotency assertions.
+            base = f'http://127.0.0.1:{port or backend_port}/public/v1'
+            request = Request(base + path, method=method,
+                              data=json.dumps(body).encode() if body is not None else None,
+                              headers={'Authorization': draft_key,
+                                       'Content-Type': 'application/json', **(headers or {})})
+            payload = None
+            try:
+                with http.open(request, timeout=3) as response:
+                    actual = response.status
+                    if 200 <= actual < 300:
+                        payload = json.load(response)
+            except HTTPError as error:
+                with error:
+                    actual = error.code
+            require(actual == status, f'scoped credential expected HTTP {status} for {method} {path}, got {actual}')
+            return payload
+
         pgdata = str(run / 'pgdata')
         init = [initdb, '-A', 'scram-sha-256', '-U', database_user,
                 '--pwfile=/dev/stdin', '-D', pgdata]
@@ -300,6 +348,24 @@ def smoke(args):
         wait_ready('Postiz backend port', lambda: listening(backend_port))
         armed, dropped = start_fault_proxy(stack, proxy_port, backend_port)
         wait_ready('Postiz workspace API', verify_backend)
+        try:
+            scoped_workspace = get(api + '/me', draft_key).get('organization', {}).get('id')
+        except HTTPError as error:
+            with error:
+                raise RuntimeError(f'scoped credential could not verify its workspace, HTTP {error.code}') from None
+        require(scoped_workspace == WORKSPACE, 'scoped credential did not verify its configured workspace')
+        draft_api_request('GET', '/me', headers={'Authorization': 'pzd_' + '0' * 64}, status=401)
+        draft_api_request('GET', '/me', headers={'x-postiz-org': 'fixture-other-workspace'}, status=403)
+        draft_api_request('GET', '/me', headers={'x-postiz-include-deleted': 'true'}, status=403)
+        draft_api_request('GET', '/media', status=403)
+        draft_api_request('GET', '/is-connected', status=403)
+        require(draft_api_request('GET', '/is-connected', headers={'Authorization': first_key}, status=200)
+                == {'connected': True}, 'the legacy API key lost access to its ordinary route')
+        draft_api_request('POST', '/upload-from-url', {'url': 'https://example.invalid/fixture.mp4'}, status=403)
+        draft_api_request('POST', '/posts', {'type': 'now'}, status=403)
+        draft_api_request('POST', '/posts', {'type': 'schedule'}, status=403)
+        draft_api_request('PUT', '/posts/fixture-post/settings', {}, status=403)
+        draft_api_request('DELETE', '/posts/fixture-post', status=403)
         health = f'http://127.0.0.1:{worker_port}/health/status'
         wait_ready('Temporal worker health', lambda: get(health).get('status') == 'ok')
         before = int(call([node, '-e', COUNT_WORKFLOWS]).strip())
@@ -319,7 +385,8 @@ def smoke(args):
         }))
         submit = [node, 'scripts/shorts-draft.mjs', '--endpoint', api, '--manifest', str(manifest),
                   '--apply', '--expected-manifest-sha256', sha256(manifest), '--journal-dir', str(run / 'receipts')]
-        first = json.loads(call(submit, {'POSTIZ_API_KEY': first_key}))
+        scoped_submit = [*submit, '--require-scoped-key']
+        first = json.loads(call(scoped_submit, {'POSTIZ_API_KEY': draft_key}))
         require(first['stage'] == 'verified' and not first['reused'], 'initial write did not verify as a new draft')
 
         stop(backend)
@@ -327,7 +394,7 @@ def smoke(args):
         del running['backend']
         wait_ready('restarted Postiz backend port', lambda: listening(backend_port))
         wait_ready('restarted Postiz workspace API', verify_backend)
-        replay = json.loads(call(submit, {'POSTIZ_API_KEY': first_key}))
+        replay = json.loads(call(scoped_submit, {'POSTIZ_API_KEY': draft_key}))
         require(replay['stage'] == 'verified' and replay['reused'] and replay['postId'] == first['postId'],
                 'same-journal replay after restart did not return the original draft')
 
@@ -348,10 +415,21 @@ def smoke(args):
         require(post['integrationId'] == INTEGRATION and 'Synthetic native smoke draft' in post['content'],
                 'the stored post lost the reviewed caption or integration')
         require(json.loads(post['image'])[0]['id'] == media['id'] == first['mediaId'], 'the stored draft lost its media attachment')
+
+        # The CLI's journal replay above only polls. A direct repeat of the
+        # same scoped mutation after the restart tests the server receipt.
+        request_body, request_headers = fixture_draft_request(manifest, media)
+        server_replay = draft_api_request('POST', '/posts', request_body, request_headers, status=201)
+        require(server_replay == [{'postId': first['postId'], 'integration': INTEGRATION}],
+                'server did not return the original draft receipt after restart')
+        draft_api_request('POST', '/posts', request_body,
+                          {**request_headers, 'X-Postiz-Draft-Manifest-Sha256': '0' * 64}, status=409)
+        require(json.loads(call([node, '-e', READ_DATABASE])) == state,
+                'repeat or conflict changed the persisted draft and media rows')
         path = urlsplit(media['path']).path
-        require(path.startswith('/uploads/'), 'the stored media path is outside the fixture uploads')
-        asset = (upload / path.removeprefix('/uploads/')).resolve()
-        require(asset.is_relative_to(upload) and sha256(asset) == first['mediaSha256'] == sha256(fixture),
+        require(path.startswith(media_prefix), 'the stored media path is outside the fixture uploads')
+        asset = (media_root / path.removeprefix(media_prefix)).resolve()
+        require(asset.is_relative_to(media_root) and sha256(asset) == first['mediaSha256'] == sha256(fixture),
                 'the stored media digest differs from the synthetic input')
         call([ffmpeg, '-v', 'error', '-xerror', '-i', str(asset), '-f', 'null', '-'])
 
@@ -362,15 +440,15 @@ def smoke(args):
             'contentId': 'fixture-lost-response', 'caption': lost_caption,
         }))
         lost_submit = [node, 'scripts/shorts-draft.mjs', '--endpoint', api,
-                       '--manifest', str(lost_manifest), '--apply',
+                       '--manifest', str(lost_manifest), '--apply', '--require-scoped-key',
                        '--expected-manifest-sha256', sha256(lost_manifest),
                        '--journal-dir', str(run / 'lost-receipts')]
         armed.set()
-        lost = call(lost_submit, {'POSTIZ_API_KEY': first_key}, expected=1)
+        lost = call(lost_submit, {'POSTIZ_API_KEY': draft_key}, expected=1)
         require(dropped.is_set() and 'POST /posts did not return a response' in lost,
                 'interrupted create returned an unexpected error')
         after_interruption = json.loads(call([node, '-e', READ_DATABASE]))
-        retry = call(lost_submit, {'POSTIZ_API_KEY': first_key}, expected=1)
+        retry = call(lost_submit, {'POSTIZ_API_KEY': draft_key}, expected=1)
         require('An earlier attempt may have written data' in retry,
                 'the client did not hold the uncertain create for reconciliation')
         final = json.loads(call([node, '-e', READ_DATABASE]))
@@ -382,20 +460,116 @@ def smoke(args):
                 and interrupted_post['organizationId'] == WORKSPACE,
                 'the interrupted fixture did not persist as an unreleased draft in the expected workspace')
         interrupted_media_id = json.loads(interrupted_post['image'])[0]['id']
-        require(interrupted_media_id != media['id'] and any(
-            row['id'] == interrupted_media_id and row['organizationId'] == WORKSPACE for row in final['media']
-        ), 'the interrupted draft does not own a distinct media row')
+        interrupted_media = next((row for row in final['media'] if row['id'] == interrupted_media_id), None)
+        require(interrupted_media_id != media['id'] and interrupted_media
+                and interrupted_media['organizationId'] == WORKSPACE,
+                'the interrupted draft does not own a distinct media row')
+
+        stop(running.pop('backend-restarted')[0])
+        launch('backend-restarted', [node, '--experimental-require-module', BACKEND])
+        wait_ready('restarted backend port after the lost response', lambda: listening(backend_port))
+        wait_ready('Postiz workspace API after the lost response', verify_backend)
+        lost_body, lost_headers = fixture_draft_request(lost_manifest, interrupted_media)
+        expected_lost_receipt = [{'postId': interrupted_post['id'], 'integration': INTEGRATION}]
+        require(draft_api_request('POST', '/posts', lost_body, lost_headers, status=201) == expected_lost_receipt,
+                'the server could not recover the lost scoped receipt after restart')
+        require(json.loads(call([node, '-e', READ_DATABASE])) == final,
+                'issued rows changed when recovering the lost receipt')
+
+        concurrent_manifest = run / 'concurrent-manifest.json'
+        concurrent_manifest.write_text(json.dumps({
+            **json.loads(manifest.read_text()), 'contentId': 'fixture-concurrent-draft',
+            'caption': 'Synthetic concurrent native smoke draft',
+        }))
+        concurrent_body, concurrent_headers = fixture_draft_request(concurrent_manifest, media)
+        start_writes = Barrier(2)
+
+        def create_concurrent_draft():
+            start_writes.wait(timeout=3)
+            return draft_api_request('POST', '/posts', concurrent_body, concurrent_headers, status=201)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            writes = [pool.submit(create_concurrent_draft) for _ in range(2)]
+            receipts = [write.result() for write in writes]
+        require(receipts[0] == receipts[1] and len(receipts[0]) == 1,
+                'concurrent first writes did not return one surviving receipt')
+        before_concurrent = final
+        final = json.loads(call([node, '-e', READ_DATABASE]))
+        added_posts = [row for row in final['posts'] if row not in before_concurrent['posts']]
+        require(len(added_posts) == 1 and len(final['posts']) == 3
+                and final['media'] == before_concurrent['media'],
+                'concurrent first writes did not create exactly one draft and no media rows')
+        [concurrent_post] = added_posts
+        require(concurrent_post['id'] == receipts[0][0]['postId'] and concurrent_post['state'] == 'DRAFT'
+                and not concurrent_post['releaseId'] and not concurrent_post['releaseURL']
+                and concurrent_post['organizationId'] == WORKSPACE,
+                'concurrent first writes returned an unexpected or released draft')
 
         after = int(call([node, '-e', COUNT_WORKFLOWS]).strip())
         require(after == 0, 'the draft run produced an unexpected Temporal workflow execution')
-        return {
+        evidence = {
             'draftId': post['id'], 'mediaId': media['id'],
             'decodedMediaHashVerified': True, 'crossWorkspaceReadEmpty': True,
             'wrongWorkspaceWriteRejected': True, 'sameJournalReplayAcrossApiRestart': True,
+            'scopedCredentialDeniedOtherActions': True, 'serverReceiptReplayAcrossApiRestart': True,
+            'serverReceiptConflictLeftDraftUnchanged': True,
             'lostResponsePersistedOnceAndRetryHeld': True,
+            'lostScopedReceiptRecoveredAfterRestart': True, 'concurrentWritesReturnedOneDraft': True,
             'persistedDrafts': len(final['posts']), 'persistedMediaRows': len(final['media']),
             'temporalExecutionsBefore': before, 'temporalExecutionsAfter': after,
         }
+        if args.verify_private_media:
+            evidence['privateMediaHttp'] = verify_private_media(
+                call=call, node=node, backend_port=backend_port, asset_path=path,
+                fixture_key=jwt, expected_digest=first['mediaSha256'], public_uploads=upload,
+            )
+        if args.verify_restore:
+            from shorts_draft_fixture_restore import rehearse_fixture_restore
+
+            stop(running.pop('backend-restarted')[0])
+            restored_port = ephemeral_ports(1)[0]
+            restored_api = f'http://127.0.0.1:{restored_port}/public/v1'
+            private_uploads = env.get('POSTIZ_PRIVATE_LOCAL_MEDIA_DIRECTORY')
+
+            def verify_restored(database, restored_media):
+                restored_env = {
+                    'DATABASE_URL': env['DATABASE_URL'].rsplit('/', 1)[0] + '/' + database,
+                    'PORT': str(restored_port),
+                    'UPLOAD_DIRECTORY': str(upload if private_uploads else restored_media),
+                }
+                if private_uploads:
+                    restored_env['POSTIZ_PRIVATE_LOCAL_MEDIA_DIRECTORY'] = str(restored_media)
+
+                restored_state = json.loads(call([node, '-e', READ_DATABASE], restored_env))
+                require(restored_state == final, 'restored metadata differs from the synthetic fixture')
+                launch('restored-backend', [node, '--experimental-require-module', BACKEND], restored_env)
+                wait_ready('restored Postiz workspace API', lambda: (
+                    get(restored_api + '/me', first_key).get('organization', {}).get('id') == WORKSPACE
+                ))
+                owner = get(restored_api + '/posts?' + query, first_key)['posts']
+                other = get(restored_api + '/posts?' + query, second_key)['posts']
+                require({row['id'] for row in owner} == {row['id'] for row in final['posts']},
+                        'restored workspace API did not return all fixture drafts to their owner')
+                require(other == [], 'the other workspace could see a restored draft')
+                receipt = draft_api_request('POST', '/posts', request_body, request_headers,
+                                            status=201, port=restored_port)
+                require(receipt == server_replay and
+                        json.loads(call([node, '-e', READ_DATABASE], restored_env)) == restored_state,
+                        'the restored receipt did not protect the fixture from a duplicate draft')
+                return {
+                    'ownerDraftsVisible': True, 'otherTenantDraftsHidden': True,
+                    'restoredDraftReceiptReplayVerified': True,
+                }
+
+            evidence['localMetadataAndMediaRestore'] = rehearse_fixture_restore(
+                run=run, uploads=Path(private_uploads) if private_uploads else upload,
+                media=final['media'], origin=origin, postgres_bin_dir=Path(args.postgres_bin_dir),
+                database_port=pg_port, database_user=database_user, database_password=password,
+                ffmpeg=ffmpeg, call=call, verify_restored=verify_restored,
+            )
+            require(int(call([node, '-e', COUNT_WORKFLOWS]).strip()) == after,
+                    'the restore rehearsal produced an unexpected Temporal workflow execution')
+        return evidence
 
 
 def main():
@@ -407,6 +581,10 @@ def main():
     parser.add_argument('--temporal', default='temporal')
     parser.add_argument('--node', default='node')
     parser.add_argument('--ffmpeg', default='ffmpeg')
+    parser.add_argument('--verify-private-media', action='store_true',
+                        help='verify private byte-range delivery in the real fixture API')
+    parser.add_argument('--verify-restore', action='store_true',
+                        help='rehearse a backup and restore within this local synthetic fixture')
     args = parser.parse_args()
     signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
     try:

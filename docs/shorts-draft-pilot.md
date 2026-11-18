@@ -51,13 +51,23 @@ The journal uses a stable operation ID for the Postiz origin, workspace, integra
 
 If an attempt is interrupted, keep the journal. Check the recorded phase, media and post IDs against the Postiz workspace and audit evidence. An upload or create request can have taken effect even when its response was missing. Pause and reconcile before another write.
 
+## Configure a scoped staging fixture
+
+Use a dedicated fixture workspace. Configure `POSTIZ_PILOT_DRAFT_API_ORG_ID` with its ID and `POSTIZ_PILOT_DRAFT_API_KEY_SHA256` with the lowercase SHA-256 digest of a dedicated `pzd_` credential followed by 64 random lowercase hexadecimal characters. Supply the original credential to the CLI using `POSTIZ_API_KEY` from the approved secret source and add `--require-scoped-key` to the apply command. Give editorial playback to a separate authorised browser session.
+
+The scoped credential can read workspace identity, integrations and drafts, upload files, and create one new unpublished draft. The CLI sends a stable `Idempotency-Key` and the reviewed manifest digest. PostgreSQL commits the organisation-scoped receipt and draft together. Repeating the same request with the same media reference while the workspace and integration remain available returns the stored result. Reusing the key with changed fields is rejected. The upload is a separate operation, so retain the media reference when reconciling a retry.
+
+For private local playback, use `STORAGE_PROVIDER=local` and set `POSTIZ_PRIVATE_LOCAL_MEDIA_DIRECTORY` to an existing dedicated directory outside public mounts. Set `FRONTEND_URL` to the exact HTTP(S) frontend origin and route `/api/` to the authenticated backend with the prefix removed. An authorised workspace session can stream the private file with byte ranges and a private, non-cacheable response. Use a fresh isolated fixture store when qualifying this route.
+
 ## Verify the pilot
 
 ```sh
-node --test scripts/shorts-draft.test.mjs scripts/shorts-draft-native-smoke.test.mjs
+node --test scripts/*.test.mjs
+python3 -B -m unittest discover -s scripts -p test_shorts_draft_fixture_restore.py
+pnpm test
 ```
 
-The fixture tests check the HTTP contract and the isolation preflight. To verify the real local stack on Linux, use Python 3.11+, FFmpeg, PostgreSQL, Redis, Temporal CLI and the Node version pinned in the repository. Install workspace dependencies and build the backend and orchestrator before entering the isolated network namespace.
+The Node fixture tests check the CLI, the isolation preflight and media handling. `pnpm test` runs the application's Jest suites after dependencies are installed. To verify the real local stack on Linux, use Python 3.11+, FFmpeg, PostgreSQL, Redis, Temporal CLI and the Node version pinned in the repository. Install workspace dependencies and build the backend and orchestrator before entering the isolated network namespace.
 
 ```sh
 pnpm install --frozen-lockfile
@@ -66,8 +76,13 @@ pnpm run build:orchestrator
 
 unshare --user --map-user="$(id -u)" --map-group="$(id -g)" \
   --net --keep-caps --pid --fork --kill-child \
-  sh -c 'ip link set lo up && exec python3 "$@"' sh \
-  scripts/shorts-draft-native-smoke.py --postgres-bin-dir "$(pg_config --bindir)"
+  sh -c 'ip link set lo up && exec python3 -B "$@"' sh \
+  scripts/shorts-draft-native-smoke.py --postgres-bin-dir "$(pg_config --bindir)" \
+  --verify-private-media --verify-restore
 ```
 
-The smoke script requires a non-root user and a namespace with only a working loopback interface. It starts fresh services, uses generated media and temporary fixture keys, and emits a JSON receipt. Verify that the wrong workspace cannot see the draft or submit the handoff, a same-journal replay after the API restarts adds no rows, and the stored MP4 matches its digest and decodes. The smoke test also drops a successful create response and checks that the draft persisted once and retry leaves the stored result alone. The Temporal execution counts should be zero before and after the cases. Managed staging must separately qualify its own image, browser playback, scoped credentials and server-side duplicate protection.
+The smoke script requires a non-root user and a namespace with only a working loopback interface. It starts fresh services, uses generated media and temporary fixture keys, and emits a JSON receipt. Verify that the wrong workspace cannot see the draft or submit the handoff, a same-journal replay after the API restarts adds no rows, and the stored MP4 matches its digest and decodes. The smoke test also drops a successful create response and checks that the draft persisted once and retry leaves the stored result alone. The Temporal execution counts should be zero before and after the cases.
+
+With `--verify-restore`, the harness uses `pg_dump`, `createdb` and `pg_restore` from the same PostgreSQL binaries. It restores the quiescent fixture into a second disposable database and a separate media directory, verifies asset digests and opens a fresh API process to check tenant visibility. The recorded durations measure the local fixture. Measure hosted recovery separately on the approved candidate.
+
+With `--verify-private-media`, the smoke test uses synthetic browser sessions to verify owner access, an exact `206` byte range, cache controls and access denial for anonymous and other-tenant requests over HTTP. Play and seek in a real browser on the approved staging candidate to complete playback acceptance.

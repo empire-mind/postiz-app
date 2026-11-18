@@ -1,6 +1,7 @@
 import { CloudflareStorage } from './cloudflare.storage';
 import { IUploadProvider } from './upload.interface';
 import { LocalStorage } from './local.storage';
+import { getPrivateLocalMedia } from './private-local-media';
 import { IMediaProcessor } from './media.processor.interface';
 import { RunPodMediaProcessor } from './runpod.media.processor';
 import {
@@ -12,6 +13,10 @@ import {
 
 export class UploadFactory {
   static createStorage(): IUploadProvider {
+    const privateMedia = getPrivateLocalMedia();
+    if (privateMedia) {
+      return new LocalStorage(privateMedia.directory, privateMedia.urlPrefix);
+    }
     const storageProvider = process.env.STORAGE_PROVIDER || 'local';
 
     switch (storageProvider) {

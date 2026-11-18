@@ -24,7 +24,10 @@ const LOCAL_STORAGE_ALLOWED_MIME = new Set<string>([
   'audio/ogg',
 ]);
 export class LocalStorage implements IUploadProvider {
-  constructor(private uploadDirectory: string) {}
+  constructor(
+    private uploadDirectory: string,
+    private urlPrefix: string = process.env.FRONTEND_URL + '/uploads'
+  ) {}
 
   // Files live under /YYYY/MM/DD with a random name; creates the folder
   private newFilePath(ext: string) {
@@ -46,7 +49,7 @@ export class LocalStorage implements IUploadProvider {
     return {
       filename,
       filePath: `${dir}/${filename}`,
-      path: process.env.FRONTEND_URL + '/uploads' + `${innerPath}/${filename}`,
+      path: this.urlPrefix + `${innerPath}/${filename}`,
     };
   }
 
@@ -142,11 +145,10 @@ export class LocalStorage implements IUploadProvider {
   // stored media name or path, so only a file inside the upload directory is
   // ever deleted: resolve() collapses any `..` segments before the comparison
   async removeFile(filePath: string): Promise<void> {
-    const publicPrefix = process.env.FRONTEND_URL + '/uploads';
     const base = resolve(String(this.uploadDirectory));
     const localPath = resolve(
-      filePath.startsWith(publicPrefix)
-        ? this.uploadDirectory + filePath.slice(publicPrefix.length)
+      filePath.startsWith(this.urlPrefix + '/')
+        ? this.uploadDirectory + filePath.slice(this.urlPrefix.length)
         : filePath
     );
     if (!localPath.startsWith(base + sep)) {

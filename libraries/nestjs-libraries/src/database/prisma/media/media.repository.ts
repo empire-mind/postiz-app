@@ -84,6 +84,13 @@ export class MediaRepository {
     });
   }
 
+  async hasLocalMediaPath(organizationId: string, path: string) {
+    return !!(await this._media.model.media.findFirst({
+      where: { organizationId, path, deletedAt: null },
+      select: { id: true },
+    }));
+  }
+
   deleteMedia(org: string, id: string) {
     return this._media.model.media.update({
       where: {

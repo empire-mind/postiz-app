@@ -69,6 +69,8 @@ async function fixture(t, options = {}) {
         query: url.searchParams,
         authorization: request.headers.authorization,
         contentType: request.headers['content-type'],
+        idempotencyKey: request.headers['idempotency-key'],
+        reviewedManifest: request.headers['x-postiz-draft-manifest-sha256'],
         body: await consume(request),
       };
       requests.push(call);
@@ -137,9 +139,10 @@ async function fixture(t, options = {}) {
         '--journal-dir', journal
       );
     }
+    if (overrides.requireScopedKey) args.push('--require-scoped-key');
     try {
       const result = await exec(process.execPath, args, {
-        env: { ...process.env, POSTIZ_API_KEY: fixtureKey },
+        env: { ...process.env, POSTIZ_API_KEY: overrides.key ?? fixtureKey },
         timeout: 15_000,
       });
       return { ...result, code: 0 };
@@ -187,6 +190,11 @@ test('apply sends one multipart upload and one draft-only request, then reads it
   assert.match(upload.body.toString(), /name="file"/);
   assert(upload.body.includes(fixtureAsset));
   const post = JSON.parse(f.requests[3].body);
+  assert.equal(f.requests[3].idempotencyKey, sha(JSON.stringify([
+    f.manifest.workspaceId, f.manifest.integrationId, f.manifest.contentId,
+  ])));
+  assert.equal(f.requests[3].reviewedManifest, sha(JSON.stringify(f.manifest)));
+  assert(f.requests.every((call, index) => index === 3 || !call.idempotencyKey));
   assert.equal(post.type, 'draft');
   assert.equal(post.posts.length, 1);
   assert.equal(post.posts[0].type, 'draft');
@@ -206,6 +214,19 @@ test('a changed manifest fails its expected digest before network I/O', async (t
   const result = await f.run({ apply: true });
   assert.notEqual(result.code, 0);
   assert.deepEqual(f.requests, []);
+});
+
+test('a scoped rehearsal refuses a legacy key before sending any request', async (t) => {
+  const f = await fixture(t);
+  const denied = await f.run({ apply: true, requireScopedKey: true });
+  assert.equal(denied.code, 1, denied.stdout);
+  assert.match(denied.stderr, /scoped draft credential/i);
+  assert.deepEqual(f.requests, []);
+
+  const key = 'pzd_' + 'a'.repeat(64);
+  const allowed = await f.run({ apply: true, requireScopedKey: true, key });
+  assert.equal(allowed.code, 0, allowed.stderr);
+  assert(f.requests.every(({ authorization }) => authorization === key));
 });
 
 test('a media fingerprint mismatch fails before network I/O', async (t) => {

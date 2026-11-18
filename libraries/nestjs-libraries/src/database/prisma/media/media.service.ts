@@ -102,6 +102,10 @@ export class MediaService {
     return this._mediaRepository.getMediaById(id);
   }
 
+  hasLocalMediaPath(organizationId: string, path: string) {
+    return this._mediaRepository.hasLocalMediaPath(organizationId, path);
+  }
+
   async generateImage(
     prompt: string,
     org: Organization,

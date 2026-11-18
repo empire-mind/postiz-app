@@ -1,0 +1,174 @@
+---
+name: OCI candidate
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/oci-candidate.yml'
+      - '.dockerignore'
+      - '.npmrc'
+      - 'Dockerfile.dev'
+      - 'LICENSE'
+      - 'package.json'
+      - 'pnpm-*.yaml'
+      - 'tsconfig*.json'
+      - 'apps/**'
+      - 'libraries/**'
+      - 'patches/**'
+      - 'scripts/**'
+      - 'var/docker/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oci-candidate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and verify linux/amd64 OCI candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Build a local OCI layout
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          work="$RUNNER_TEMP/postiz-oci-candidate"
+          mkdir -p "$work"
+
+          docker buildx version > "$work/buildx-version.txt"
+          docker buildx create --name postiz-candidate --driver docker-container --use
+          docker buildx inspect --bootstrap > "$work/buildkit-inspect.txt"
+          docker buildx build \
+            --platform linux/amd64 \
+            --file Dockerfile.dev \
+            --tag "postiz-oci-candidate:$GITHUB_SHA" \
+            --build-arg "NEXT_PUBLIC_VERSION=$GITHUB_SHA" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --metadata-file "$work/build-metadata.json" \
+            --provenance=mode=min \
+            --sbom=true \
+            --output "type=oci,dest=$work/layout,tar=false,oci-artifact=false" \
+            .
+
+      - name: Verify the digest, platform and attestations
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          work = Path(os.environ['RUNNER_TEMP']) / 'postiz-oci-candidate'
+          layout = work / 'layout'
+          revision = os.environ['GITHUB_SHA']
+
+          def read_blob(descriptor):
+              digest = descriptor['digest']
+              if not re.fullmatch(r'sha256:[0-9a-f]{64}', digest):
+                  raise ValueError(f'Invalid OCI digest {digest}')
+              data = (layout / 'blobs' / 'sha256' / digest[7:]).read_bytes()
+              if len(data) != descriptor['size'] or hashlib.sha256(data).hexdigest() != digest[7:]:
+                  raise ValueError(f'OCI blob integrity check failed for {digest}')
+              return json.loads(data)
+
+          def image_manifests(index):
+              for descriptor in index['manifests']:
+                  manifest = read_blob(descriptor)
+                  if 'manifests' in manifest:
+                      yield from image_manifests(manifest)
+                  else:
+                      yield descriptor, manifest
+
+          index_bytes = (layout / 'index.json').read_bytes()
+          index = json.loads(index_bytes)
+          entries = list(image_manifests(index))
+          [(image, manifest)] = [
+              (descriptor, payload) for descriptor, payload in entries
+              if descriptor.get('platform', {}).get('os') == 'linux'
+              and descriptor.get('platform', {}).get('architecture') == 'amd64'
+          ]
+          config = read_blob(manifest['config'])
+          if (config['os'], config['architecture']) != ('linux', 'amd64'):
+              raise ValueError('Image platform differs from the requested candidate platform')
+          if config['config']['Labels']['org.opencontainers.image.revision'] != revision:
+              raise ValueError('Image revision differs from the checked-out source')
+
+          evidence = []
+          for descriptor, manifest in entries:
+              annotations = descriptor.get('annotations', {})
+              if annotations.get('vnd.docker.reference.type') != 'attestation-manifest':
+                  continue
+              if annotations.get('vnd.docker.reference.digest') != image['digest']:
+                  continue
+              for layer in manifest['layers']:
+                  if layer['mediaType'] != 'application/vnd.in-toto+json':
+                      continue
+                  statement = read_blob(layer)
+                  if not any(subject.get('digest', {}).get('sha256') == image['digest'][7:]
+                             for subject in statement['subject']):
+                      raise ValueError('Attestation subject differs from the candidate image')
+                  evidence.append({
+                      'predicateType': statement['predicateType'],
+                      'digest': layer['digest'],
+                      'sizeBytes': layer['size'],
+                  })
+
+          predicates = {entry['predicateType'] for entry in evidence}
+          if 'https://spdx.dev/Document' not in predicates:
+              raise ValueError('Candidate SPDX SBOM attestation missing')
+          if not any(predicate.startswith('https://slsa.dev/provenance/') for predicate in predicates):
+              raise ValueError('Candidate SLSA provenance attestation missing')
+
+          metadata = json.loads((work / 'build-metadata.json').read_text())
+          result_digest = metadata['containerimage.digest']
+          if not any(descriptor['digest'] == result_digest for descriptor in index['manifests']):
+              raise ValueError('Buildx result digest is absent from the OCI layout index')
+          buildkit_version = next(
+              line.partition(':')[2].strip()
+              for line in (work / 'buildkit-inspect.txt').read_text().splitlines()
+              if line.lstrip().startswith('BuildKit version:')
+          )
+          receipt = {
+              'schemaVersion': 1,
+              'sourceRevision': revision,
+              'pullRequestHead': os.environ.get('PR_HEAD_SHA') or None,
+              'platform': 'linux/amd64',
+              'buildx': (work / 'buildx-version.txt').read_text().strip(),
+              'buildkit': buildkit_version,
+              'ociLayoutIndexDigest': 'sha256:' + hashlib.sha256(index_bytes).hexdigest(),
+              'buildxResultDigest': result_digest,
+              'imageManifestDigest': image['digest'],
+              'attestations': evidence,
+          }
+          (work / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as summary:
+              summary.write(
+                  '### Local OCI candidate verified\n\n'
+                  f'- Source revision `{revision}`\n'
+                  f'- Platform `linux/amd64`\n'
+                  f'- Image manifest `{image["digest"]}`\n'
+                  '- Verified SPDX SBOM and SLSA provenance for that image\n'
+                  '- Retained a receipt only. The build used local OCI output.\n'
+              )
+          PY
+
+      - name: Retain the build receipt
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: postiz-oci-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/postiz-oci-candidate/receipt.json
+          if-no-files-found: error
+          retention-days: 7

@@ -4,11 +4,13 @@ import {
   Controller,
   Delete,
   Get,
+  NotFoundException,
   Param,
   Post,
   Query,
   Req,
   Res,
+  StreamableFile,
   UploadedFile,
   UseInterceptors,
 } from '@nestjs/common';
@@ -25,6 +27,11 @@ import { UploadFactory } from '@gitroom/nestjs-libraries/upload/upload.factory';
 import { SaveMediaInformationDto } from '@gitroom/nestjs-libraries/dtos/media/save.media.information.dto';
 import { VideoDto } from '@gitroom/nestjs-libraries/dtos/videos/video.dto';
 import { VideoFunctionDto } from '@gitroom/nestjs-libraries/dtos/videos/video.function.dto';
+import {
+  getPrivateLocalMedia,
+  openPrivateLocalMedia,
+} from '@gitroom/nestjs-libraries/upload/private-local-media';
+import type { PrivateLocalMediaKey } from '@gitroom/nestjs-libraries/upload/private-local-media';
 
 @ApiTags('Media')
 @Controller('/media')
@@ -34,6 +41,23 @@ export class MediaController {
     private _mediaService: MediaService,
     private _subscriptionService: SubscriptionService
   ) {}
+
+  @Get('/private-local/:year/:month/:day/:file')
+  async readPrivateLocalMedia(
+    @GetOrgFromRequest() org: Organization,
+    @Param() key: PrivateLocalMediaKey,
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response
+  ) {
+    res.setHeader('Cache-Control', 'private, no-store');
+    const media = await openPrivateLocalMedia(
+      getPrivateLocalMedia(), key, req.headers.range,
+      (path) => this._mediaService.hasLocalMediaPath(org.id, path)
+    );
+    if (!media) throw new NotFoundException();
+    res.status(media.status).set(media.headers);
+    if (media.stream) return new StreamableFile(media.stream);
+  }
 
   @Delete('/:id')
   deleteMedia(@GetOrgFromRequest() org: Organization, @Param('id') id: string) {

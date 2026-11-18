@@ -5,6 +5,12 @@ import { OrganizationService } from '@gitroom/nestjs-libraries/database/prisma/o
 import { OAuthService } from '@gitroom/nestjs-libraries/database/prisma/oauth/oauth.service';
 import { HttpForbiddenException } from '@gitroom/nestjs-libraries/services/exception.filter';
 import { setSentryUserContext } from '@gitroom/nestjs-libraries/sentry/initialize.sentry';
+import {
+  allowsDraftApiRequest,
+  authorizedDraftApiOrganization,
+  draftApiPrincipal,
+  type DraftApiRequest,
+} from './draft.api.access';
 
 @Injectable()
 export class PublicAuthMiddleware implements NestMiddleware {
@@ -23,7 +29,7 @@ export class PublicAuthMiddleware implements NestMiddleware {
   async use(req: Request, res: Response, next: NextFunction) {
     const auth = (req.headers.authorization ||
       req.headers.Authorization) as string;
-    if (!auth) {
+    if (typeof auth !== 'string' || !auth) {
       res.status(HttpStatus.UNAUTHORIZED).json({ msg: 'No API Key found' });
       return;
     }
@@ -34,7 +40,30 @@ export class PublicAuthMiddleware implements NestMiddleware {
       // @ts-ignore
       req.isOAuthApp = isOAuthApp;
 
-      if (isOAuthApp) {
+      if (auth.startsWith('pzd_')) {
+        const orgId = authorizedDraftApiOrganization(
+          auth,
+          process.env.POSTIZ_PILOT_DRAFT_API_KEY_SHA256,
+          process.env.POSTIZ_PILOT_DRAFT_API_ORG_ID
+        );
+        if (!orgId) {
+          res.status(HttpStatus.UNAUTHORIZED).json({ msg: 'Invalid draft API key' });
+          return;
+        }
+        if (!allowsDraftApiRequest(req)) {
+          res.status(HttpStatus.FORBIDDEN).json({ msg: 'Outside draft API scope' });
+          return;
+        }
+
+        const draftOrg = await this._organizationService.getOrgByIdWithSubscription(orgId);
+        if (!draftOrg || draftOrg.deletedAt) {
+          res.status(HttpStatus.UNAUTHORIZED).json({ msg: 'Invalid draft API key' });
+          return;
+        }
+
+        org = draftOrg;
+        (req as DraftApiRequest)[draftApiPrincipal] = true;
+      } else if (isOAuthApp) {
         const authorization = await this._oauthService.getOrgByOAuthToken(auth);
         if (!authorization) {
           res

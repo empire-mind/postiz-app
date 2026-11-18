@@ -4,15 +4,18 @@ import {
   Controller,
   Delete,
   Get,
+  Headers,
   HttpException,
   Param,
   Post,
   Put,
   Query,
+  Req,
   UploadedFile,
   UseGuards,
   UseInterceptors,
 } from '@nestjs/common';
+import { Request } from 'express';
 import { streamUploadOptions } from '@gitroom/nestjs-libraries/upload/multer.stream.engine';
 import { omit } from 'lodash';
 import { ApiTags } from '@nestjs/swagger';
@@ -23,6 +26,11 @@ import { Organization } from '@prisma/client';
 import { IntegrationService } from '@gitroom/nestjs-libraries/database/prisma/integrations/integration.service';
 import { CheckPolicies } from '@gitroom/backend/services/auth/permissions/permissions.ability';
 import { PostsService } from '@gitroom/nestjs-libraries/database/prisma/posts/posts.service';
+import { DraftIntakeService } from '@gitroom/nestjs-libraries/database/prisma/posts/draft.intake.service';
+import {
+  draftApiPrincipal,
+  type DraftApiRequest,
+} from '@gitroom/backend/services/auth/draft.api.access';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { MediaService } from '@gitroom/nestjs-libraries/database/prisma/media/media.service';
 import { GetPostsDto } from '@gitroom/nestjs-libraries/dtos/posts/get.posts.dto';
@@ -76,13 +84,15 @@ export class PublicIntegrationsController {
     private _adminStatsService: AdminStatsService,
     private _organizationService: OrganizationService,
     private _clippingService: ClippingService,
-    private _subscriptionService: SubscriptionService
+    private _subscriptionService: SubscriptionService,
+    private _draftIntakeService: DraftIntakeService
   ) {}
 
   @Post('/upload')
   @UseInterceptors(FileInterceptor('file', streamUploadOptions()))
   async uploadSimple(
     @GetOrgFromRequest() org: Organization,
+    @Req() request: Request,
     @UploadedFile('file') file: Express.Multer.File,
     @Body('adjust') adjust: string = 'false'
   ) {
@@ -91,7 +101,7 @@ export class PublicIntegrationsController {
       throw new HttpException({ msg: 'No file provided' }, 400);
     }
 
-    if (adjust === 'true') {
+    if (adjust === 'true' && !(request as DraftApiRequest)[draftApiPrincipal]) {
       return this._mediaService.saveUploadedFile(
         org.id,
         file.filename,
@@ -135,12 +145,15 @@ export class PublicIntegrationsController {
   @Get('/posts')
   async getPosts(
     @GetOrgFromRequest() org: Organization,
+    @Req() request: Request,
     @Query() query: GetPostsDto
   ) {
     Sentry.metrics.count('public_api-request', 1);
     const posts = await this._postsService.getPosts(org.id, query);
     return {
-      posts,
+      posts: (request as DraftApiRequest)[draftApiPrincipal]
+        ? posts.filter((post) => post.state === 'DRAFT')
+        : posts,
       // comments,
     };
   }
@@ -149,7 +162,10 @@ export class PublicIntegrationsController {
   @CheckPolicies([AuthorizationActions.Create, Sections.POSTS_PER_MONTH])
   async createPost(
     @GetOrgFromRequest() org: Organization,
-    @Body() rawBody: any
+    @Body() rawBody: any,
+    @Req() request: Request,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
+    @Headers('x-postiz-draft-manifest-sha256') manifestSha256: string | undefined
   ) {
     Sentry.metrics.count('public_api-request', 1);
     const body = await this._postsService.mapTypeToPost(
@@ -181,6 +197,25 @@ export class PublicIntegrationsController {
           msg: `All media must be uploaded through our upload API route and contain the domain: ${process.env.RESTRICT_UPLOAD_DOMAINS}`,
         },
         400
+      );
+    }
+
+    const allowedCreationMethods = ['CLI', 'API'] as const;
+    const creationMethod = allowedCreationMethods.includes(
+      rawBody.creationMethod
+    )
+      ? (rawBody.creationMethod as 'CLI' | 'API')
+      : 'API';
+
+    if ((request as DraftApiRequest)[draftApiPrincipal]) {
+      // The scoped intake checks tenant media ownership before using the
+      // supplied path. Do not pass it to provider validators first.
+      return this._draftIntakeService.createScopedDraft(
+        org.id,
+        idempotencyKey,
+        body,
+        creationMethod,
+        manifestSha256
       );
     }
 
@@ -221,13 +256,6 @@ export class PublicIntegrationsController {
         }
       }
     }
-
-    const allowedCreationMethods = ['CLI', 'API'] as const;
-    const creationMethod = allowedCreationMethods.includes(
-      rawBody.creationMethod
-    )
-      ? (rawBody.creationMethod as 'CLI' | 'API')
-      : 'API';
 
     return this._postsService.createPost(org.id, body, creationMethod);
   }

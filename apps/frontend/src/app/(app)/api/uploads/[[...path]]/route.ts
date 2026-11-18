@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { createReadStream, statSync } from 'fs';
+import { createReadStream, realpathSync, statSync } from 'fs';
+import type { Stats } from 'fs';
 import { resolve, sep } from 'path';
 // @ts-ignore
 import mime from 'mime';
@@ -31,12 +32,25 @@ export const GET = async (
   const { path } = await context.params;
   const base = resolve(process.env.UPLOAD_DIRECTORY!);
   const filePath = resolve(base, (path ?? []).join('/'));
-  // Confine reads to UPLOAD_DIRECTORY. resolve() collapses any `..` segments
-  // (including URL-decoded ones), so this blocks every path-traversal variant.
-  if (filePath !== base && !filePath.startsWith(base + sep)) {
+  // Keep decoded paths and any resolved symlinks within the public root.
+  if (!filePath.startsWith(base + sep)) {
     return new NextResponse('Not found', { status: 404 });
   }
-  const fileStats = statSync(filePath);
+  let realFilePath: string;
+  let fileStats: Stats;
+  try {
+    realFilePath = realpathSync(filePath);
+    if (!realFilePath.startsWith(realpathSync(base) + sep)) {
+      return new NextResponse('Not found', { status: 404 });
+    }
+    fileStats = statSync(realFilePath);
+    if (!fileStats.isFile()) return new NextResponse('Not found', { status: 404 });
+  } catch (error) {
+    if (['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) {
+      return new NextResponse('Not found', { status: 404 });
+    }
+    throw error;
+  }
   const contentType = mime.getType(filePath) || 'application/octet-stream';
 
   // Honor ranged requests: providers that push video in chunks (TikTok,
@@ -56,7 +70,7 @@ export const GET = async (
     });
   }
 
-  const response = createReadStream(filePath, range ? { start, end } : {});
+  const response = createReadStream(realFilePath, range ? { start, end } : {});
   const iterator = nodeStreamToIterator(response);
   const webStream = iteratorToStream(iterator);
   return new Response(webStream, {

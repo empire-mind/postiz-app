@@ -45,7 +45,7 @@ node scripts/shorts-draft.mjs \
   --journal-dir ./local-pilot-receipts
 ```
 
-The command checks workspace and integration identity before uploading. It uploads the exact reviewed MP4 through the public Postiz upload API, passes the returned media reference to a draft-only create request, then verifies the returned post ID in the authenticated calendar listing. Success requires state `DRAFT`, the expected account and provider, and empty release identifiers. Review the asset and caption on the draft in the calendar.
+The command checks workspace and integration identity before uploading. It uploads the exact reviewed MP4 through the public Postiz upload API, passes the returned media reference to a draft-only create request, then verifies the returned post ID in the authenticated calendar listing. Success requires state `DRAFT`, the reviewed caption and calendar time, the expected account and provider, and empty release identifiers. If the provider rewrites the caption, the command reports a mismatch and retains the receipt for reconciliation. Review the stored asset in the calendar.
 
 The journal uses a stable operation ID for the Postiz origin, workspace, integration and content ID. It stores digests, phase and returned IDs. A repeat of the same manifest with a known post ID performs read-back. A different manifest or an unfinished write blocks another attempt. The local operation guard covers concurrent calls and process interruptions for callers sharing the same journal directory.
 
@@ -54,7 +54,20 @@ If an attempt is interrupted, keep the journal. Check the recorded phase, media 
 ## Verify the pilot
 
 ```sh
-node --test scripts/shorts-draft.test.mjs
+node --test scripts/shorts-draft.test.mjs scripts/shorts-draft-native-smoke.test.mjs
 ```
 
-The fixture tests check the HTTP contract with synthetic media on loopback. The managed staging run must separately prove real persistence, media playback and zero publishing workflow starts for draft submissions.
+The fixture tests check the HTTP contract and the isolation preflight. To verify the real local stack on Linux, use Python 3.11+, FFmpeg, PostgreSQL, Redis, Temporal CLI and the Node version pinned in the repository. Install workspace dependencies and build the backend and orchestrator before entering the isolated network namespace.
+
+```sh
+pnpm install --frozen-lockfile
+pnpm run build:backend
+pnpm run build:orchestrator
+
+unshare --user --map-user="$(id -u)" --map-group="$(id -g)" \
+  --net --keep-caps --pid --fork --kill-child \
+  sh -c 'ip link set lo up && exec python3 "$@"' sh \
+  scripts/shorts-draft-native-smoke.py --postgres-bin-dir "$(pg_config --bindir)"
+```
+
+The smoke script requires a non-root user and a namespace with only a working loopback interface. It starts fresh services, uses generated media and temporary fixture keys, and emits a JSON receipt. Verify that the wrong workspace cannot see the draft or submit the handoff, a same-journal replay after the API restarts adds no rows, and the stored MP4 matches its digest and decodes. The smoke test also drops a successful create response and checks that the draft persisted once and retry leaves the stored result alone. The Temporal execution counts should be zero before and after the cases. Managed staging must separately qualify its own image, browser playback, scoped credentials and server-side duplicate protection.

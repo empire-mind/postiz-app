@@ -26,7 +26,7 @@ jobs:
           package-manager-cache: false
 
       - name: Test the Shorts draft handoff
-        run: node --test scripts/shorts-draft.test.mjs
+        run: node --test scripts/shorts-draft.test.mjs scripts/shorts-draft-native-smoke.test.mjs
 
       - name: Enable the pinned pnpm version
         run: corepack enable pnpm

@@ -103,6 +103,8 @@ async function fixture(t, options = {}) {
         json(response, { posts: [{
           id: 'draft-001',
           state: options.readbackState ?? 'DRAFT',
+          content: options.readbackContent ?? '<p>Owned clip &lt;take 2&gt; &amp; approved notes</p>',
+          publishDate: options.readbackDate ?? '2031-07-15T11:30:00.000Z',
           releaseId: null,
           releaseURL: null,
           integration: { id: manifest.integrationId, providerIdentifier: manifest.provider },
@@ -283,6 +285,55 @@ test('a readback outside DRAFT rejects acceptance without replaying mutations', 
     'POST ' + prefix + '/upload',
     'POST ' + prefix + '/posts',
   ]);
+});
+
+test('read-back rejects a changed caption or calendar time without repeating the write', async (t) => {
+  for (const [label, changes] of [
+    ['caption changed', { readbackContent: '<p>A different caption</p>' }],
+    ['calendar time moved', { readbackDate: '2031-07-15T11:30:15.000Z' }],
+  ]) {
+    await t.test(label, async (t) => {
+      const readback = {};
+      const f = await fixture(t, readback);
+      const result = await f.run({ apply: true });
+      assert.equal(result.code, 0, result.stderr);
+
+      // The saved draft no longer matches the reviewed export.
+      Object.assign(readback, changes);
+      const replay = await f.run({ apply: true });
+
+      assert.equal(replay.code, 1, replay.stdout);
+      assert.match(replay.stderr, /read-back/i);
+      assert.deepEqual(routeLabels(mutations(f.requests)), [
+        'POST ' + prefix + '/upload',
+        'POST ' + prefix + '/posts',
+      ]);
+    });
+  }
+});
+
+test('the approved caption round-trips with a nonbreaking space and a carriage-return line break', async (t) => {
+  const f = await fixture(t, { readbackContent: '<p>A&nbsp;caption</p><p>Next line</p>' });
+  const changed = JSON.stringify({ ...f.manifest, caption: 'A\u00a0caption\rNext line' });
+  await writeFile(f.manifestPath, changed);
+
+  const result = await f.run({ apply: true, manifestSha: sha(changed) });
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(JSON.parse(f.requests[3].body).posts[0].value[0].content,
+    '<p>A&nbsp;caption</p><p>Next line</p>');
+});
+
+test('a null character in the reviewed caption is rejected before any HTTP call', async (t) => {
+  const f = await fixture(t);
+  const changed = JSON.stringify({ ...f.manifest, caption: 'A\u0000 caption' });
+  await writeFile(f.manifestPath, changed);
+
+  const result = await f.run({ apply: true, manifestSha: sha(changed) });
+
+  assert.equal(result.code, 1, result.stdout);
+  assert.match(result.stderr, /caption.*null/i);
+  assert.deepEqual(f.requests, []);
 });
 
 test('a media path on a different origin blocks draft creation', async (t) => {

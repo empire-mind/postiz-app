@@ -66,6 +66,7 @@ async function readManifest(file) {
     typeof manifest.caption === 'string' && manifest.caption.trim().length > 0,
     'A caption is required.'
   );
+  assert(!manifest.caption.includes('\0'), 'The reviewed caption cannot contain a null character.');
   assert(
     typeof manifest.mediaSha256 === 'string' && sha256.test(manifest.mediaSha256),
     'A lowercase SHA-256 media digest is required.'
@@ -138,13 +139,16 @@ async function verifyDestination(request, manifest) {
   );
 }
 
-function draftBody(manifest, date, media) {
-  const escape = (value) => value.replace(/[&<>]/g, (char) => (
-    { '&': '&amp;', '<': '&lt;', '>': '&gt;' }[char]
+function captionHtml(caption) {
+  const escape = (value) => value.replace(/[&<>\u00a0]/g, (char) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '\u00a0': '&nbsp;' }[char]
   ));
-  const content = manifest.caption.trim().split(/\r?\n/).map((line) => (
+  return caption.trim().split(/\r\n?|\n/).map((line) => (
     '<p>' + escape(line) + '</p>'
   )).join('');
+}
+
+function draftBody(manifest, date, media) {
   return {
     type: 'draft',
     date,
@@ -154,7 +158,7 @@ function draftBody(manifest, date, media) {
     posts: [{
       type: 'draft',
       integration: { id: manifest.integrationId },
-      value: [{ content, image: [{ id: media.id, path: media.path }] }],
+      value: [{ content: captionHtml(manifest.caption), image: [{ id: media.id, path: media.path }] }],
     }],
   };
 }
@@ -170,8 +174,10 @@ async function verifyDraft(request, manifest, date, postId) {
   assert(
     post && post.state === 'DRAFT' && post.releaseId === null && post.releaseURL === null &&
       post.integration?.id === manifest.integrationId &&
-      post.integration?.providerIdentifier === manifest.provider,
-    'Read-back did not confirm the expected unpublished DRAFT.'
+      post.integration?.providerIdentifier === manifest.provider &&
+      post.content === captionHtml(manifest.caption) &&
+      typeof post.publishDate === 'string' && Date.parse(post.publishDate) === calendarTime,
+    'Read-back did not confirm the reviewed caption, calendar time and unpublished DRAFT destination.'
   );
 }
 

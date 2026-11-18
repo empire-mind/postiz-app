@@ -9,6 +9,10 @@ import { useLaunchStore } from '@gitroom/frontend/components/new-launch/store';
 import { useVariables } from '@gitroom/react/helpers/variable.context';
 import { useModals } from '@gitroom/frontend/components/layout/new-modal';
 import { MediaBox } from '@gitroom/frontend/components/media/media.component';
+import {
+  createThumbnailUploadForm,
+  getThumbnailVideoSource,
+} from './thumbnail.media';
 const postUrlEmitter = new EventEmitter();
 
 export const MediaSettingsLayout = () => {
@@ -102,7 +106,7 @@ export const CreateThumbnail: FC<{
   onAltTextChange?: (altText: string) => void;
 }> = (props) => {
   const { onSelect, media } = props;
-  const { backendUrl } = useVariables();
+  const { backendUrl, frontEndUrl } = useVariables();
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [currentTime, setCurrentTime] = useState(0);
@@ -216,9 +220,7 @@ export const CreateThumbnail: FC<{
       <div className="relative bg-black rounded-lg overflow-hidden">
         <video
           ref={videoRef}
-          src={
-            backendUrl + '/public/stream?url=' + encodeURIComponent(media.path)
-          }
+          src={getThumbnailVideoSource(media.path, backendUrl, frontEndUrl)}
           className="w-full h-[200px] object-contain"
           onLoadedMetadata={handleLoadedMetadata}
           onTimeUpdate={handleTimeUpdate}
@@ -313,6 +315,7 @@ export const MediaComponentInner: FC<{
   const { onClose, onSelect, media } = props;
   const setActivateExitButton = useLaunchStore((e) => e.setActivateExitButton);
   const newFetch = useFetch();
+  const { frontEndUrl } = useVariables();
   const modals = useModals();
   const [newThumbnail, setNewThumbnail] = useState<string | null>(null);
   const [isEditingThumbnail, setIsEditingThumbnail] = useState(false);
@@ -333,13 +336,12 @@ export const MediaComponentInner: FC<{
   }, []);
 
   const save = useCallback(async () => {
+    if (!media) return;
     setLoading(true);
     let path = thumbnail || '';
     if (newThumbnail) {
       const blob = await (await fetch(newThumbnail)).blob();
-      const formData = new FormData();
-      formData.append('file', blob, 'media.jpg');
-      formData.append('preventSave', 'true');
+      const formData = createThumbnailUploadForm(blob, media.path, frontEndUrl);
       const data = await (
         await newFetch('/media/upload-simple', {
           method: 'POST',
@@ -349,11 +351,11 @@ export const MediaComponentInner: FC<{
       path = data.path;
     }
 
-    const media = await (
+    const updatedMedia = await (
       await newFetch('/media/information', {
         method: 'POST',
         body: JSON.stringify({
-          id: props.media.id,
+          id: media.id,
           alt: altText,
           thumbnail: path,
           thumbnailTimestamp: thumbnailTimestamp,
@@ -361,9 +363,19 @@ export const MediaComponentInner: FC<{
       })
     ).json();
 
-    onSelect(media);
+    onSelect(updatedMedia);
     onClose();
-  }, [altText, newThumbnail, thumbnail, thumbnailTimestamp]);
+  }, [
+    altText,
+    frontEndUrl,
+    media,
+    newFetch,
+    newThumbnail,
+    onClose,
+    onSelect,
+    thumbnail,
+    thumbnailTimestamp,
+  ]);
 
   return (
     <div className="mt-[10px] flex flex-col gap-[20px]">

@@ -59,6 +59,8 @@ The scoped credential can read workspace identity, integrations and drafts, uplo
 
 For private local playback, use `STORAGE_PROVIDER=local` and set `POSTIZ_PRIVATE_LOCAL_MEDIA_DIRECTORY` to an existing dedicated directory outside public mounts. Set `FRONTEND_URL` to the exact HTTP(S) frontend origin and route `/api/` to the authenticated backend with the prefix removed. An authorised workspace session can stream the private file with byte ranges and a private, non-cacheable response. Use a fresh isolated fixture store when qualifying this route.
 
+For a container rehearsal, pin the Postiz candidate digest and mount a separate writable volume at `POSTIZ_PRIVATE_LOCAL_MEDIA_DIRECTORY`. Include that volume in the same recovery drill as the database. Preserve the original browser-facing origin during restore because private media URLs stored in the database are absolute.
+
 ## Verify the pilot
 
 ```sh
